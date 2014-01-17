@@ -2,14 +2,14 @@ from django import forms
 from django.contrib.sites.models import get_current_site
 from django.utils.translation import ugettext_lazy as _
 
-from organizations.models import Organization, OrganizationUser, get_user_model
+from organizations.models import get_user_model, get_organization_model, get_organization_user_model
 from organizations.utils import create_organization
 from organizations.backends import invitation_backend
 
 
 class OrganizationForm(forms.ModelForm):
     """Form class for updating Organizations"""
-    owner = forms.ModelChoiceField(OrganizationUser.objects.all())
+    owner = forms.ModelChoiceField(get_organization_user_model().objects.all())
 
     def __init__(self, request, *args, **kwargs):
         self.request = request
@@ -19,7 +19,7 @@ class OrganizationForm(forms.ModelForm):
         self.fields['owner'].initial = self.instance.owner.organization_user
 
     class Meta:
-        model = Organization
+        model = get_organization_model()
         exclude = ('users', 'is_active')
 
     def save(self, commit=True):
@@ -32,7 +32,7 @@ class OrganizationForm(forms.ModelForm):
         owner = self.cleaned_data['owner']
         if owner != self.instance.owner.organization_user:
             if self.request.user != self.instance.owner.organization_user.user:
-                raise forms.ValidationError(_("Only the organization owner can change ownerhip"))
+                raise forms.ValidationError(_("Only the organization owner can change ownership"))
         return owner
 
 
@@ -40,7 +40,7 @@ class OrganizationUserForm(forms.ModelForm):
     """Form class for updating OrganizationUsers"""
 
     class Meta:
-        model = OrganizationUser
+        model = get_organization_user_model()
         exclude = ('organization', 'user')
 
     def clean_is_admin(self):
@@ -60,7 +60,7 @@ class OrganizationUserAddForm(forms.ModelForm):
         super(OrganizationUserAddForm, self).__init__(*args, **kwargs)
 
     class Meta:
-        model = OrganizationUser
+        model = get_organization_user_model()
         exclude = ('user', 'organization')
 
     def save(self, *args, **kwargs):
@@ -79,17 +79,22 @@ class OrganizationUserAddForm(forms.ModelForm):
                     self.cleaned_data['email'],
                     **{'domain': get_current_site(self.request),
                         'organization': self.organization})
-        return OrganizationUser.objects.create(user=user,
+        return self.Meta.model.objects.create(user=user,
                 organization=self.organization,
                 is_admin=self.cleaned_data['is_admin'])
 
     def clean_email(self):
         email = self.cleaned_data['email']
-        if self.organization.users.filter(email=email):
-            raise forms.ValidationError(_("There is already an organization "
-                                          "member with this email address!"))
+        try:
+            user = get_user_model().objects.get(email__iexact=self.cleaned_data['email'])
+        except get_user_model().MultipleObjectsReturned:
+            raise forms.ValidationError(_("This email address has been used multiple times."))
+        except get_user_model().DoesNotExist:
+            pass # good
+        else:
+            if self.organization.organization_users.filter(user=user).count() > 0:
+                raise forms.ValidationError(_("This user is already a member of this organization!"))
         return email
-
 
 class OrganizationAddForm(forms.ModelForm):
     """
@@ -104,7 +109,7 @@ class OrganizationAddForm(forms.ModelForm):
         super(OrganizationAddForm, self).__init__(*args, **kwargs)
 
     class Meta:
-        model = Organization
+        model = get_organization_model()
         exclude = ('users', 'is_active')
 
     def save(self, **kwargs):

@@ -1,6 +1,6 @@
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
-from django.db import models
+from django.db import connection, models
 from django.db.models import permalink, get_model
 from django.utils.translation import ugettext_lazy as _
 
@@ -8,9 +8,9 @@ from django_extensions.db.fields import AutoSlugField
 from django_extensions.db.models import TimeStampedModel
 from organizations.managers import OrgManager, ActiveOrgManager
 
-
 USER_MODEL = getattr(settings, 'AUTH_USER_MODEL', 'auth.User')
-
+ORGANIZATION_MODEL = getattr(settings, 'ORGANIZATION_MODEL', 'organizations.Organization')
+ORGANIZATION_USER_MODEL = getattr(settings, 'ORGANIZATION_USER_MODEL', 'organizations.OrganizationUser')
 
 def get_user_model():
     """
@@ -20,12 +20,42 @@ def get_user_model():
     try:
         klass = get_model(USER_MODEL.split('.')[0], USER_MODEL.split('.')[1])
     except:
-        raise ImproperlyConfigured("Your user class, {0},"
-                " is improperly defined".format(USER_MODEL))
+        raise ImproperlyConfigured("Your user class, {0}, is improperly defined".format(klass_string))
     return klass
 
+def get_organization_model():
+    """
+    Returns the chosen model as a class.
+    """
+    try:
+        klass = get_model(ORGANIZATION_MODEL.split('.')[0], ORGANIZATION_MODEL.split('.')[1])
+    except:
+        raise ImproperlyConfigured("Your organization class, {0}, is improperly defined".format(klass_string))
+    return klass
 
-class Organization(TimeStampedModel):
+def get_organization_user_model():
+    """
+    Returns the chosen model as a class.
+    """
+    try:
+        klass = get_model(ORGANIZATION_USER_MODEL.split('.')[0], ORGANIZATION_USER_MODEL.split('.')[1])
+    except:
+        raise ImproperlyConfigured("Your organization user class, {0}, is improperly defined".format(klass_string))
+    return klass
+
+if connection.features.supports_joins:
+    # this is the case for typical relational sql db
+    class AbstractOrganizationBase(TimeStampedModel):
+
+        users = models.ManyToManyField(USER_MODEL, through="OrganizationUser")
+
+        class Meta:
+            abstract = True
+else:
+    # this is typically the NoSQL Django-nonrel case (e.g., mongodb or gae)
+    AbstractOrganizationBase = TimeStampedModel
+
+class AbstractOrganization(AbstractOrganizationBase):
     """
     The umbrella object with which users can be associated.
 
@@ -38,13 +68,13 @@ class Organization(TimeStampedModel):
     slug = AutoSlugField(max_length=200, blank=False, editable=True,
             populate_from='name', unique=True,
             help_text=_("The name in all lowercase, suitable for URL identification"))
-    users = models.ManyToManyField(USER_MODEL, through="OrganizationUser")
     is_active = models.BooleanField(default=True)
 
     objects = OrgManager()
     active = ActiveOrgManager()
 
     class Meta:
+        abstract = True
         ordering = ['name']
         verbose_name = _("organization")
         verbose_name_plural = _("organizations")
@@ -61,10 +91,10 @@ class Organization(TimeStampedModel):
         Adds a new user and if the first user makes the user an admin and
         the owner.
         """
-        users_count = self.users.all().count()
+        users_count = self.organization_users.all().count()
         if users_count == 0:
             is_admin = True
-        org_user = OrganizationUser.objects.create(user=user,
+        org_user = ORGANIZATION_USER_MODEL.objects.create(user=user,
                 organization=self, is_admin=is_admin)
         if users_count == 0:
             OrganizationOwner.objects.create(organization=self,
@@ -83,11 +113,11 @@ class Organization(TimeStampedModel):
         `OrganizationUser` and a boolean value indicating whether the
         OrganizationUser was created or not.
         """
-        users_count = self.users.all().count()
+        users_count = self.organization_users.all().count()
         if users_count == 0:
             is_admin = True
 
-        org_user, created = OrganizationUser.objects.get_or_create(
+        org_user, created = ORGANIZATION_USER_MODEL.objects.get_or_create(
                 organization=self, user=user, defaults={'is_admin': is_admin})
 
         if users_count == 0:
@@ -97,13 +127,15 @@ class Organization(TimeStampedModel):
         return org_user, created
 
     def is_member(self, user):
-        return True if user in self.users.all() else False
+        return next((ou for ou in self.organization_users.all() if ou.user_id == user.id), False) and True
 
     def is_admin(self, user):
         return True if self.organization_users.filter(user=user, is_admin=True) else False
 
+class Organization(AbstractOrganization):
+    pass
 
-class OrganizationUser(TimeStampedModel):
+class AbstractOrganizationUser(TimeStampedModel):
     """
     ManyToMany through field relating Users to Organizations.
 
@@ -116,11 +148,12 @@ class OrganizationUser(TimeStampedModel):
 
     """
     user = models.ForeignKey(USER_MODEL, related_name="organization_users")
-    organization = models.ForeignKey(Organization,
+    organization = models.ForeignKey(ORGANIZATION_MODEL,
             related_name="organization_users")
     is_admin = models.BooleanField(default=False)
 
     class Meta:
+        abstract = True
         ordering = ['organization', 'user']
         unique_together = ('user', 'organization')
         verbose_name = _("organization user")
@@ -140,8 +173,7 @@ class OrganizationUser(TimeStampedModel):
         from organizations.exceptions import OwnershipRequired
         try:
             if self.organization.owner.organization_user.id == self.id:
-                raise OwnershipRequired(_("Cannot delete organization owner "
-                    "before organization or transferring ownership."))
+                raise OwnershipRequired(_("Cannot delete organization owner before organization or transferring ownership."))
         except OrganizationOwner.DoesNotExist:
             pass
         super(OrganizationUser, self).delete(using=using)
@@ -157,12 +189,18 @@ class OrganizationUser(TimeStampedModel):
             return self.user.get_full_name()
         return "{0}".format(self.user)
 
+class OrganizationUser(AbstractOrganizationUser):
+    # swappable is necessary to prevent model validation errors
+    # coming from the ForeignKey fields' reverse relations, which
+    # would be duplicate by both this class as well as the custom class.
+    class Meta:
+        swappable = 'ORGANIZATION_USER_MODEL'
 
 class OrganizationOwner(TimeStampedModel):
     """Each organization must have one and only one organization owner."""
 
-    organization = models.OneToOneField(Organization, related_name="owner")
-    organization_user = models.OneToOneField(OrganizationUser,
+    organization = models.OneToOneField(ORGANIZATION_MODEL, related_name="owner")
+    organization_user = models.OneToOneField(ORGANIZATION_USER_MODEL,
             related_name="owned_organization")
 
     class Meta:
