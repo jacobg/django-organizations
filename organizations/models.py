@@ -43,7 +43,7 @@ def get_organization_user_model():
         raise ImproperlyConfigured("Your organization user class, {0}, is improperly defined".format(klass_string))
     return klass
 
-if connection.features.supports_joins:
+if getattr(connection.features, 'supports_joins', True):
     # this is the case for typical relational sql db
     class AbstractOrganizationBase(TimeStampedModel):
 
